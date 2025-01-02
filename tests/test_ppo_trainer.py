@@ -19,6 +19,7 @@ import torch
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoModelForSequenceClassification, AutoTokenizer
 from transformers.testing_utils import require_peft
+from transformers.models.auto.modeling_auto import MODEL_FOR_VISION_2_SEQ_MAPPING_NAMES
 
 from trl import PPOConfig, PPOTrainer
 from trl.trainer.utils import SIMPLE_CHAT_TEMPLATE
@@ -222,3 +223,6 @@ class TestPPOTrainer(unittest.TestCase):
 
             self.assertTrue(critic_weights_updated, "Critic weights were not updated during training")
             self.assertTrue(policy_weights_updated, "Policy weights were not updated during training")
+    
+    def test_vision_ppo_trainer():
+        # TODO: fill 

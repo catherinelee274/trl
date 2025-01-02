@@ -47,6 +47,7 @@ from transformers.trainer import DEFAULT_CALLBACKS, DEFAULT_PROGRESS_CALLBACK
 from transformers.trainer_callback import CallbackHandler, ExportableState, PrinterCallback
 from transformers.utils import is_peft_available
 from transformers.utils.deprecation import deprecate_kwarg
+from transformers.models.auto.modeling_auto import MODEL_FOR_VISION_2_SEQ_MAPPING_NAMES
 
 from ..core import masked_mean, masked_whiten
 from ..models import create_reference_model
@@ -137,6 +138,14 @@ class PPOTrainer(Trainer):
         # Define the collator if not provided
         if data_collator is None:
             data_collator = DataCollatorWithPadding(self.processing_class)
+
+        if model and reward_model: 
+            self.is_vision_model = model.config.model_type in MODEL_FOR_VISION_2_SEQ_MAPPING_NAMES.keys()
+        else:
+            warnings.warn(
+                "No model provided, cannot determine if it is a vision model. Setting is_vision_model to False."
+            )
+            self.is_vision_model = False
 
         self.policy_model.generation_config.eos_token_id = (
             None  # disable `pad_token_id` and `eos_token_id` because we just want to
