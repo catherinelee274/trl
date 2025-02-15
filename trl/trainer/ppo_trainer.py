@@ -688,6 +688,7 @@ class PPOTrainer(Trainer):
         args = self.args
         processing_class = self.processing_class
         generation_config = GenerationConfig(
+            # TODO: add here
             max_new_tokens=self.args.response_length,
             temperature=(0.01 + 1e-7),
             top_k=0.0,
