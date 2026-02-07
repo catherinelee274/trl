@@ -28,6 +28,8 @@ _import_structure = {
         "WeaveCallback",
         "WinRateCallback",
     ],
+    "cascade_rl_config": ["CascadeRLConfig", "CascadeRLStage"],
+    "cascade_rl_trainer": ["CascadeRLTrainer"],
     "cpo_config": ["CPOConfig"],
     "cpo_trainer": ["CPOTrainer"],
     "dpo_config": ["DPOConfig", "FDivergenceConstants", "FDivergenceType"],
@@ -81,6 +83,8 @@ if TYPE_CHECKING:
         WeaveCallback,
         WinRateCallback,
     )
+    from .cascade_rl_config import CascadeRLConfig, CascadeRLStage
+    from .cascade_rl_trainer import CascadeRLTrainer
     from .cpo_config import CPOConfig
     from .cpo_trainer import CPOTrainer
     from .dpo_config import DPOConfig, FDivergenceConstants, FDivergenceType
