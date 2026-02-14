@@ -32,6 +32,8 @@ _import_structure = {
     "cpo_trainer": ["CPOTrainer"],  # deprecated import
     "dpo_config": ["DPOConfig", "FDivergenceConstants", "FDivergenceType"],
     "dpo_trainer": ["DPOTrainer"],
+    "dqo_config": ["DQOConfig"],
+    "dqo_trainer": ["DQOTrainer"],
     "gkd_config": ["GKDConfig"],  # deprecated import
     "gkd_trainer": ["GKDTrainer"],  # deprecated import
     "grpo_config": ["GRPOConfig"],
@@ -93,6 +95,8 @@ if TYPE_CHECKING:
     from .cpo_trainer import CPOTrainer  # deprecated import
     from .dpo_config import DPOConfig, FDivergenceConstants, FDivergenceType
     from .dpo_trainer import DPOTrainer
+    from .dqo_config import DQOConfig
+    from .dqo_trainer import DQOTrainer
     from .gkd_config import GKDConfig  # deprecated import
     from .gkd_trainer import GKDTrainer  # deprecated import
     from .grpo_config import GRPOConfig
