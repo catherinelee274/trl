@@ -44,6 +44,8 @@ _import_structure = {
     ],
     "models": [
         "create_reference_model",
+        "QSharpClassifier",
+        "QSharpLogitProcessor",
     ],
     "scripts": ["DatasetMixtureConfig", "ScriptArguments", "TrlParser", "get_dataset", "init_zero_verbose"],
     "trainer": [
@@ -58,6 +60,7 @@ _import_structure = {
         "KTOTrainer",
         "LogCompletionsCallback",
         "ModelConfig",
+        "QSharpConfig",
         "RewardConfig",
         "RewardTrainer",
         "RichProgressCallback",
@@ -92,6 +95,8 @@ if TYPE_CHECKING:
     )
     from .models import (
         create_reference_model,
+        QSharpClassifier,
+        QSharpLogitProcessor,
     )
     from .scripts import DatasetMixtureConfig, ScriptArguments, TrlParser, get_dataset, init_zero_verbose
     from .trainer import (
@@ -106,6 +111,7 @@ if TYPE_CHECKING:
         KTOTrainer,
         LogCompletionsCallback,
         ModelConfig,
+        QSharpConfig,
         RewardConfig,
         RewardTrainer,
         RichProgressCallback,

@@ -15,7 +15,29 @@ from torch.nn import BCEWithLogitsLoss, MSELoss
 from transformers import LlamaPreTrainedModel, LlamaModel, LogitsProcessor
 from transformers.modeling_outputs import SequenceClassifierOutputWithPast
 from transformers.cache_utils import Cache
-from transformers.models.llama.modeling_llama import _prepare_4d_causal_attention_mask_with_cache_position
+
+# Try to import the attention mask preparation function, use fallback if not available
+try:
+    from transformers.models.llama.modeling_llama import _prepare_4d_causal_attention_mask_with_cache_position
+except ImportError:
+    # Fallback for older transformers versions
+    try:
+        from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask_with_cache_position
+    except ImportError:
+        # If neither import works, we'll define a simple fallback
+        def _prepare_4d_causal_attention_mask_with_cache_position(
+            attention_mask, sequence_length, target_length, dtype, device, min_dtype, cache_position, batch_size
+        ):
+            # Simple fallback: create a causal mask
+            causal_mask = torch.full((target_length, target_length), min_dtype, dtype=dtype, device=device)
+            causal_mask = torch.triu(causal_mask, diagonal=1)
+            causal_mask = causal_mask[None, None, :, :].expand(batch_size, 1, -1, -1)
+            if attention_mask is not None:
+                causal_mask = causal_mask.clone()  # copy to contiguous memory for in-place operations
+                mask_length = attention_mask.shape[-1]
+                padding_mask = causal_mask[..., :mask_length, :mask_length] + attention_mask[:, None, None, :]
+                causal_mask[..., :mask_length, :mask_length] = padding_mask
+            return causal_mask
 
 
 class QSharpClassifier(LlamaPreTrainedModel):
