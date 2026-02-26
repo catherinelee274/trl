@@ -18,6 +18,8 @@ from .._lazy_module import _LazyModule
 
 
 _import_structure = {
+    "apo_config": ["APOConfig"],
+    "apo_trainer": ["APOTrainer"],
     "callbacks": [
         "BEMACallback",
         "LogCompletionsCallback",
@@ -48,6 +50,8 @@ _import_structure = {
 }
 
 if TYPE_CHECKING:
+    from .apo_config import APOConfig
+    from .apo_trainer import APOTrainer
     from .callbacks import (
         BEMACallback,
         LogCompletionsCallback,

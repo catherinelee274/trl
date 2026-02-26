@@ -45,6 +45,8 @@ _import_structure = {
     "models": ["create_reference_model"],
     "scripts": ["DatasetMixtureConfig", "ScriptArguments", "TrlParser", "get_dataset", "init_zero_verbose"],
     "trainer": [
+        "APOConfig",
+        "APOTrainer",
         "BEMACallback",
         "DPOConfig",
         "DPOTrainer",
@@ -89,6 +91,8 @@ if TYPE_CHECKING:
     from .models import create_reference_model
     from .scripts import DatasetMixtureConfig, ScriptArguments, TrlParser, get_dataset, init_zero_verbose
     from .trainer import (
+        APOConfig,
+        APOTrainer,
         BEMACallback,
         DPOConfig,
         DPOTrainer,
