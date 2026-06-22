@@ -50,8 +50,6 @@ python examples/scripts/reward_modeling.py \
     --lora_alpha 16
 """
 
-import os
-
 import torch
 from accelerate import logging
 from datasets import load_dataset
@@ -69,9 +67,6 @@ from trl import (
 
 
 logger = logging.get_logger(__name__)
-
-# Enable logging in a Hugging Face Space
-os.environ.setdefault("TRACKIO_SPACE_ID", "trl-trackio")
 
 
 if __name__ == "__main__":
@@ -94,7 +89,7 @@ if __name__ == "__main__":
         model_kwargs["quantization_config"] = quantization_config
 
     model = AutoModelForSequenceClassification.from_pretrained(
-        model_args.model_name_or_path, num_labels=1, trust_remote_code=model_args.trust_remote_code, **model_kwargs
+        model_args.model_name_or_path, num_labels=1, **model_kwargs
     )
 
     if model_args.use_peft and model_args.lora_task_type != "SEQ_CLS":

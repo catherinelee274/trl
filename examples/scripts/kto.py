@@ -14,8 +14,7 @@
 
 # /// script
 # dependencies = [
-#     "trl",
-#     "peft",
+#     "trl[peft]",
 #     "trackio",
 #     "kernels",
 # ]
@@ -58,8 +57,6 @@ python trl/scripts/kto.py \
     --lora_alpha 16
 """
 
-import os
-
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, HfArgumentParser
 
@@ -67,25 +64,15 @@ from trl import ModelConfig, ScriptArguments, get_peft_config
 from trl.experimental.kto import KTOConfig, KTOTrainer
 
 
-# Enable logging in a Hugging Face Space
-os.environ.setdefault("TRACKIO_SPACE_ID", "trl-trackio")
-
-
 if __name__ == "__main__":
     parser = HfArgumentParser((ScriptArguments, KTOConfig, ModelConfig))
     script_args, training_args, model_args = parser.parse_args_into_dataclasses()
 
     # Load a pretrained model
-    model = AutoModelForCausalLM.from_pretrained(
-        model_args.model_name_or_path, trust_remote_code=model_args.trust_remote_code
-    )
-    ref_model = AutoModelForCausalLM.from_pretrained(
-        model_args.model_name_or_path, trust_remote_code=model_args.trust_remote_code
-    )
+    model = AutoModelForCausalLM.from_pretrained(model_args.model_name_or_path)
+    ref_model = AutoModelForCausalLM.from_pretrained(model_args.model_name_or_path)
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_args.model_name_or_path, trust_remote_code=model_args.trust_remote_code
-    )
+    tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 

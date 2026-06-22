@@ -13,14 +13,13 @@
 # limitations under the License.
 
 import itertools
-import logging
+import warnings
 from collections.abc import Callable
 from contextlib import contextmanager
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any
 
 import accelerate
-import torch
 import torch.nn as nn
 import transformers
 from accelerate import Accelerator
@@ -28,7 +27,12 @@ from packaging.version import Version
 from torch.distributed.fsdp import FSDPModule
 from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel as FSDP
 from transformers import GenerationConfig, PreTrainedModel
-from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
+
+from ..import_utils import suppress_experimental_warning
+
+
+with suppress_experimental_warning():
+    from ..experimental.utils import create_reference_model as _create_reference_model
 
 
 if Version(accelerate.__version__) >= Version("1.11.0"):
@@ -83,6 +87,15 @@ def add_hooks(model: "DeepSpeedEngine") -> None:
         optimizer_offload = model.optimizer
     else:
         raise RuntimeError("The model optimizer is None, which is not yet supported.")
+
+    # Invalidate parameter coordinator trace to prevent stale state
+    # after generation forward passes (fixes ZeRO-3 + GKD compatibility)
+    if hasattr(optimizer_offload, "param_coordinator"):  # param_coordinator only exists in ZeRO stage 3
+        coordinator = optimizer_offload.param_coordinator
+        # Only invalidate if trace is not already invalid
+        if not coordinator.is_invalid_trace():
+            coordinator._invalidate_trace()
+
     if Version(deepspeed.__version__) >= Version("0.16.4"):
         # Account for renaming in https://github.com/deepspeedai/DeepSpeed/pull/6847
         optimizer_offload._register_deepspeed_module(optimizer_offload.module)
@@ -121,7 +134,9 @@ def _unwrap_model_for_generation(
     is_gradient_checkpointing = unwrapped_model.is_gradient_checkpointing
     if is_gradient_checkpointing:
         unwrapped_model.gradient_checkpointing_disable()
-    if accelerator.state.deepspeed_plugin is not None and accelerator.state.deepspeed_plugin.zero_stage == 3:
+    from ..distributed import DistributedBackend
+
+    if DistributedBackend(accelerator).is_zero3:
         if not gather_deepspeed3_params:
             yield accelerator.unwrap_model(model)
         else:
@@ -286,7 +301,7 @@ def prepare_fsdp(model, accelerator: Accelerator) -> FSDP | FSDPModule:
             if Version(accelerate.__version__) >= Version("1.11.0"):
                 ignored_params = get_parameters_from_modules(fsdp_plugin.ignored_modules, model, accelerator.device)
             else:
-                logging.warning(
+                warnings.warn(
                     "FSDP version 2 is being used with accelerate version < 1.11.0, which may lead to incorrect "
                     "handling of ignored modules. Please upgrade accelerate to v1.11.0 or later for proper support."
                 )
@@ -357,16 +372,6 @@ class _ForwardRedirection:
         pass
 
 
-def peft_module_casting_to_bf16(model):
-    for name, module in model.named_modules():
-        if isinstance(module, torch.nn.LayerNorm) or "norm" in name:
-            module = module.to(torch.float32)
-        elif any(x in name for x in ["lm_head", "embed_tokens", "wte", "wpe"]):
-            if hasattr(module, "weight"):
-                if module.weight.dtype == torch.float32:
-                    module = module.to(torch.bfloat16)
-
-
 @contextmanager
 def disable_gradient_checkpointing(model: PreTrainedModel, gradient_checkpointing_kwargs: dict | None = None):
     """
@@ -388,84 +393,14 @@ def disable_gradient_checkpointing(model: PreTrainedModel, gradient_checkpointin
             model.gradient_checkpointing_enable(gradient_checkpointing_kwargs)
 
 
-LAYER_PATTERNS = [
-    "transformer.h.{layer}",
-    "model.decoder.layers.{layer}",
-    "gpt_neox.layers.{layer}",
-    "model.layers.{layer}",
-]
-
-
 def create_reference_model(
     model: nn.Module, num_shared_layers: int | None = None, pattern: str | None = None
 ) -> nn.Module:
-    """
-    Creates a static reference copy of a model. Note that model will be in `.eval()` mode.
-
-    Args:
-        model ([`nn.Module`]): The model to be copied.
-        num_shared_layers (`int`, *optional*):
-            The number of initial layers that are shared between both models and kept frozen.
-        pattern (`str`, *optional*): The shared layers are selected with a string pattern
-            (e.g. "transformer.h.{layer}" for GPT2) and if a custom pattern is necessary it can be passed here.
-
-    Returns:
-        [`nn.Module`]
-    """
-    if is_deepspeed_zero3_enabled():
-        raise ValueError(
-            "DeepSpeed ZeRO-3 is enabled and is not compatible with `create_reference_model()`. Please instantiate your reference model directly with `AutoModelForCausalLM.from_pretrained()`."
-        )
-
-    parameter_names = [n for n, _ in model.named_parameters()]
-    ref_model = deepcopy(model)
-
-    # if no layers are shared, return copy of model
-    if num_shared_layers is None:
-        for param_name in parameter_names:
-            param = ref_model.get_parameter(param_name)
-            param.requires_grad = False
-        return ref_model.eval()
-
-    # identify layer name pattern
-    if pattern is not None:
-        pattern = pattern.format(layer=num_shared_layers)
-    else:
-        for pattern_candidate in LAYER_PATTERNS:
-            pattern_candidate = pattern_candidate.format(layer=num_shared_layers)
-            if any(pattern_candidate in name for name in parameter_names):
-                pattern = pattern_candidate
-                break
-
-    if pattern is None:
-        raise ValueError("Layer pattern could not be matched.")
-
-    # divide parameters in shared and unshared parameter lists
-    shared_param_list = []
-    unshared_param_list = []
-
-    shared_parameter = True
-    for name, _param in model.named_parameters():
-        if pattern in name:
-            shared_parameter = False
-        if shared_parameter:
-            shared_param_list.append(name)
-        else:
-            unshared_param_list.append(name)
-
-    # create reference of the original parameter if they are shared
-    for param_name in shared_param_list:
-        param = model.get_parameter(param_name)
-        param.requires_grad = False
-
-        _ref_param = ref_model.get_parameter(param_name)
-
-    # for all other parameters just make sure they don't use gradients
-    for param_name in unshared_param_list:
-        param = ref_model.get_parameter(param_name)
-        param.requires_grad = False
-
-    if pattern is not None and len(unshared_param_list) == 0:
-        logging.warning("Pattern passed or found, but no layers matched in the model. Check for a typo.")
-
-    return ref_model.eval()
+    warnings.warn(
+        "The `create_reference_model` function is now located in `trl.experimental.utils`. Please update your "
+        "imports to `from trl.experimental.utils import create_reference_model`. This import path will be removed in "
+        "TRL 1.0.0.",
+        FutureWarning,
+        stacklevel=2,
+    )
+    return _create_reference_model(model, num_shared_layers=num_shared_layers, pattern=pattern)

@@ -14,14 +14,12 @@
 
 # /// script
 # dependencies = [
-#     "trl",
-#     "peft",
+#     "trl[peft]",
 #     "trackio",
 #     "kernels",
 # ]
 # ///
 
-import os
 import shutil
 
 import torch
@@ -38,15 +36,10 @@ from trl import ModelConfig, ScriptArguments, get_kbit_device_map, get_peft_conf
 from trl.experimental.ppo import PPOConfig, PPOTrainer
 
 
-# Enable logging in a Hugging Face Space
-os.environ.setdefault("TRACKIO_SPACE_ID", "trl-trackio")
-
-
 """
 python examples/scripts/ppo/ppo_tldr.py \
     --dataset_name trl-lib/tldr \
     --dataset_test_split validation \
-    --learning_rate 3e-6 \
     --output_dir pythia-1b-deduped-tldr-preference-sft-trl-style-ppo \
     --per_device_train_batch_size 1 \
     --gradient_accumulation_steps 64 \
@@ -65,7 +58,6 @@ accelerate launch --config_file examples/accelerate_configs/deepspeed_zero2.yaml
     --dataset_name trl-lib/tldr \
     --dataset_test_split validation \
     --output_dir pythia-1b-deduped-tldr-preference-sft-trl-style-ppo \
-    --learning_rate 3e-6 \
     --per_device_train_batch_size 16 \
     --gradient_accumulation_steps 4 \
     --total_episodes 1000000 \
@@ -101,31 +93,21 @@ if __name__ == "__main__":
         model_kwargs["device_map"] = get_kbit_device_map()
         model_kwargs["quantization_config"] = quantization_config
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_args.model_name_or_path, padding_side="left", trust_remote_code=model_args.trust_remote_code
-    )
+    tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path, padding_side="left")
     tokenizer.add_special_tokens({"pad_token": "[PAD]"})
     value_model = AutoModelForSequenceClassification.from_pretrained(
-        training_args.reward_model_path,
-        trust_remote_code=model_args.trust_remote_code,
-        num_labels=1,
-        **model_kwargs,
+        training_args.reward_model_path, num_labels=1, **model_kwargs
     )
     reward_model = AutoModelForSequenceClassification.from_pretrained(
         training_args.reward_model_path,
-        trust_remote_code=model_args.trust_remote_code,
         num_labels=1,
         **model_kwargs,
     )
-    policy = AutoModelForCausalLM.from_pretrained(
-        training_args.sft_model_path, trust_remote_code=model_args.trust_remote_code, **model_kwargs
-    )
+    policy = AutoModelForCausalLM.from_pretrained(training_args.sft_model_path, **model_kwargs)
 
     peft_config = get_peft_config(model_args)
     if peft_config is None:
-        ref_policy = AutoModelForCausalLM.from_pretrained(
-            training_args.sft_model_path, trust_remote_code=model_args.trust_remote_code, **model_kwargs
-        )
+        ref_policy = AutoModelForCausalLM.from_pretrained(training_args.sft_model_path, **model_kwargs)
     else:
         ref_policy = None
 

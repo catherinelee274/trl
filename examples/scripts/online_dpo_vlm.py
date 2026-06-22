@@ -14,8 +14,7 @@
 
 # /// script
 # dependencies = [
-#     "trl",
-#     "peft",
+#     "trl[peft]",
 #     "math-verify",
 #     "latex2sympy2_extended",
 #     "trackio",
@@ -81,8 +80,6 @@ python examples/scripts/online_dpo_vlm.py \
     --trust_remote_code
 """
 
-import os
-
 import torch
 import transformers
 from datasets import load_dataset
@@ -99,10 +96,6 @@ from trl import (
 )
 from trl.experimental.online_dpo import OnlineDPOConfig, OnlineDPOTrainer
 from trl.rewards import accuracy_reward, think_format_reward
-
-
-# Enable logging in a Hugging Face Space
-os.environ.setdefault("TRACKIO_SPACE_ID", "trl-trackio")
 
 
 if __name__ == "__main__":
@@ -126,21 +119,14 @@ if __name__ == "__main__":
     # Load the VLM model using correct architecture (from GRPO pattern)
     config = AutoConfig.from_pretrained(model_args.model_name_or_path)
     architecture = getattr(transformers, config.architectures[0])
-    model = architecture.from_pretrained(
-        model_args.model_name_or_path, trust_remote_code=model_args.trust_remote_code, **model_kwargs
-    )
+    model = architecture.from_pretrained(model_args.model_name_or_path, **model_kwargs)
 
     # For VLM online DPO, using a reward model is complex because it needs images
-    # Instead, we'll use a simple random judge for testing
-    # In production, you'd want to use a proper text-only reward model or a custom judge
     reward_model = None
     reward_processor = None
 
     # Load processor for main model
-    processor = AutoProcessor.from_pretrained(
-        model_args.model_name_or_path,
-        trust_remote_code=model_args.trust_remote_code,
-    )
+    processor = AutoProcessor.from_pretrained(model_args.model_name_or_path)
     if hasattr(processor, "tokenizer"):
         processor.tokenizer.padding_side = "left"
         if processor.tokenizer.pad_token_id is None:

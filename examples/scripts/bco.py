@@ -14,8 +14,7 @@
 
 # /// script
 # dependencies = [
-#     "trl",
-#     "peft",
+#     "trl[peft]",
 #     "einops",
 #     "scikit-learn",
 #     "joblib",
@@ -35,7 +34,6 @@ python examples/scripts/bco.py \
     --per_device_train_batch_size 16 \
     --per_device_eval_batch_size 32 \
     --num_train_epochs 1 \
-    --learning_rate 1e-6 \
     --gradient_accumulation_steps 1 \
     --eval_steps 0.2 \
     --save_strategy no \
@@ -54,7 +52,6 @@ python examples/scripts/bco.py \
     --per_device_train_batch_size 16 \
     --per_device_eval_batch_size 32 \
     --num_train_epochs 1 \
-    --learning_rate 1e-6 \
     --gradient_accumulation_steps 1 \
     --eval_steps 0.2 \
     --save_strategy no \
@@ -72,7 +69,6 @@ python examples/scripts/bco.py \
     --lora_alpha 16
 """
 
-import os
 from functools import partial
 
 import torch
@@ -83,10 +79,6 @@ from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer, HfArgum
 
 from trl import ModelConfig, ScriptArguments, get_peft_config
 from trl.experimental.bco import BCOConfig, BCOTrainer
-
-
-# Enable logging in a Hugging Face Space
-os.environ.setdefault("TRACKIO_SPACE_ID", "trl-trackio")
 
 
 def embed_prompt(input_ids: torch.LongTensor, attention_mask: torch.LongTensor, model: PreTrainedModel):
@@ -119,16 +111,10 @@ if __name__ == "__main__":
     training_args.gradient_checkpointing_kwargs = {"use_reentrant": True}
 
     # Load a pretrained model
-    model = AutoModelForCausalLM.from_pretrained(
-        model_args.model_name_or_path, trust_remote_code=model_args.trust_remote_code
-    )
-    ref_model = AutoModelForCausalLM.from_pretrained(
-        model_args.model_name_or_path, trust_remote_code=model_args.trust_remote_code
-    )
+    model = AutoModelForCausalLM.from_pretrained(model_args.model_name_or_path)
+    ref_model = AutoModelForCausalLM.from_pretrained(model_args.model_name_or_path)
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_args.model_name_or_path, trust_remote_code=model_args.trust_remote_code
-    )
+    tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -137,15 +123,12 @@ if __name__ == "__main__":
     accelerator = Accelerator()
     embedding_model = AutoModel.from_pretrained(
         "nomic-ai/nomic-embed-text-v1.5",
-        trust_remote_code=model_args.trust_remote_code,
         safe_serialization=True,
         dtype=torch.bfloat16,
         device_map="auto",
     )
     embedding_model = accelerator.prepare_model(embedding_model)
-    embedding_tokenizer = AutoTokenizer.from_pretrained(
-        "bert-base-uncased", trust_remote_code=model_args.trust_remote_code
-    )
+    embedding_tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
     embedding_func = partial(
         embed_prompt,
         model=embedding_model,

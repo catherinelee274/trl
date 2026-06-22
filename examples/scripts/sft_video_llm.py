@@ -14,8 +14,7 @@
 
 # /// script
 # dependencies = [
-#     "trl",
-#     "peft",
+#     "trl[peft]",
 #     "qwen-vl-utils",
 #     "torchvision",
 #     "bitsandbytes",
@@ -64,10 +63,6 @@ from qwen_vl_utils import process_vision_info
 from transformers import AutoModelForImageTextToText, AutoProcessor, BitsAndBytesConfig, Qwen2VLProcessor
 
 from trl import ModelConfig, ScriptArguments, SFTConfig, SFTTrainer, TrlParser, get_kbit_device_map
-
-
-# Enable logging in a Hugging Face Space
-os.environ.setdefault("TRACKIO_SPACE_ID", "trl-trackio")
 
 
 def download_video(url: str, cache_dir: str) -> str:
@@ -199,7 +194,6 @@ if __name__ == "__main__":
     # Model initialization
     model_kwargs = dict(
         revision=model_args.model_revision,
-        trust_remote_code=model_args.trust_remote_code,
         dtype=dtype,
         device_map=get_kbit_device_map(),
         quantization_config=bnb_config,
@@ -222,9 +216,7 @@ if __name__ == "__main__":
         model.config.use_reentrant = False
         model.enable_input_require_grads()
 
-    processor = AutoProcessor.from_pretrained(
-        model_args.model_name_or_path, trust_remote_code=model_args.trust_remote_code
-    )
+    processor = AutoProcessor.from_pretrained(model_args.model_name_or_path)
 
     # Prepare dataset
     prepared_dataset = [prepare_dataset(example, script_args.video_cache_dir) for example in dataset]
