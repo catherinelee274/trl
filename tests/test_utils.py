@@ -13,20 +13,25 @@
 # limitations under the License.
 
 import copy
+import functools
+import sys
 import textwrap
+import types
 from io import StringIO
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import transformers
+from datasets import IterableDataset
 from packaging.version import Version
-from transformers import AutoConfig, AutoModelForCausalLM
+from transformers import AutoConfig, AutoModelForCausalLM, PretrainedConfig
 from transformers.testing_utils import torch_device
 from transformers.utils import is_peft_available
 
+import trl.trainer.utils as trainer_utils
 from trl import ModelConfig
 from trl.trainer.utils import (
     RepeatSampler,
@@ -37,13 +42,17 @@ from trl.trainer.utils import (
     entropy_from_logits,
     flush_left,
     generate_model_card,
+    get_callable_name,
     get_peft_config,
     hash_module,
+    is_async_callable,
     nanstd,
     pad,
     patch_chunked_lm_head,
     print_prompt_completions_sample,
+    repeat_iterable_dataset,
     selective_log_softmax,
+    selective_log_softmax_and_entropy,
     shuffle_sequence_dict,
     split_pixel_values_by_grid,
     split_tensor_dict,
@@ -65,8 +74,11 @@ class TestUseAdapter(TrlTestCase):
             "trl-internal-testing/tiny-PeftModel", adapter_name="my_adapter"
         )
         input_ids = torch.tensor([[1, 2, 3], [4, 5, 6]])
+        enabled = model(input_ids).logits
         with model.disable_adapter():
             expected = model(input_ids).logits
+        # Otherwise the assertions below prove nothing
+        assert not torch.equal(enabled, expected)
 
         with use_adapter(model, None):
             output = model(input_ids).logits
@@ -100,6 +112,8 @@ class TestUseAdapter(TrlTestCase):
         expected_1 = model(input_ids).logits
         model.set_adapter("my_adapter_2")
         expected_2 = model(input_ids).logits
+        # Otherwise the assertions below prove nothing
+        assert not torch.equal(expected_1, expected_2)
 
         with use_adapter(model, "my_adapter_1"):
             output_1 = model(input_ids).logits
@@ -279,6 +293,77 @@ class TestGetPEFTConfig(TrlTestCase):
             assert getattr(peft_config, arg) == value
 
 
+class TestGetCallableName(TrlTestCase):
+    def test_function(self):
+        def accuracy_reward(completions):
+            return [0.0] * len(completions)
+
+        assert get_callable_name(accuracy_reward) == "accuracy_reward"
+
+    def test_partial(self):
+        def reward(completions, threshold):
+            return [0.0] * len(completions)
+
+        assert get_callable_name(functools.partial(reward, threshold=0.5)) == "reward"
+
+    def test_nested_partial(self):
+        def reward(completions, threshold):
+            return [0.0] * len(completions)
+
+        assert get_callable_name(functools.partial(functools.partial(reward), threshold=0.5)) == "reward"
+
+    def test_callable_instance(self):
+        class LengthReward:
+            def __call__(self, completions):
+                return [0.0] * len(completions)
+
+        assert get_callable_name(LengthReward()) == "LengthReward"
+
+    def test_lambda(self):
+        assert get_callable_name(lambda completions: [0.0] * len(completions)) == "<lambda>"
+
+
+class TestIsAsyncCallable(TrlTestCase):
+    def test_function(self):
+        def reward(completions):
+            return [0.0] * len(completions)
+
+        assert not is_async_callable(reward)
+
+    def test_async_function(self):
+        async def reward(completions):
+            return [0.0] * len(completions)
+
+        assert is_async_callable(reward)
+
+    def test_partial(self):
+        async def reward(completions, threshold):
+            return [0.0] * len(completions)
+
+        assert is_async_callable(functools.partial(reward, threshold=0.5))
+
+    def test_callable_instance(self):
+        class LengthReward:
+            def __call__(self, completions):
+                return [0.0] * len(completions)
+
+        assert not is_async_callable(LengthReward())
+
+    def test_async_callable_instance(self):
+        class LengthReward:
+            async def __call__(self, completions):
+                return [0.0] * len(completions)
+
+        assert is_async_callable(LengthReward())
+
+    def test_partial_of_async_callable_instance(self):
+        class LengthReward:
+            async def __call__(self, completions, threshold):
+                return [0.0] * len(completions)
+
+        assert is_async_callable(functools.partial(LengthReward(), threshold=0.5))
+
+
 class TestNanStd(TrlTestCase):
     def test_nanstd_ignores_nans(self):
         x = torch.tensor([1.0, 2.0, 3.0, float("nan")])
@@ -316,7 +401,7 @@ class TestGenerateModelCard(TrlTestCase):
         card_text = str(model_card)
         assert "[username/my_base_model](https://huggingface.co/username/my_base_model)" in card_text
         assert "my_model" in card_text
-        assert 'pipeline("text-generation", model="username/my_hub_model", device="cuda")' in card_text
+        assert 'pipeline("text-generation", model="username/my_hub_model", device_map="auto")' in card_text
         assert "datasets: username/my_dataset" in card_text
         assert "](https://wandb.ai/username/project_id/runs/abcd1234)" in card_text
         assert "](https://huggingface.co/spaces/username/space_id)" in card_text
@@ -342,7 +427,7 @@ class TestGenerateModelCard(TrlTestCase):
         )
         card_text = str(model_card)
         assert "my_model" in card_text
-        assert 'pipeline("text-generation", model="username/my_hub_model", device="cuda")' in card_text
+        assert 'pipeline("text-generation", model="username/my_hub_model", device_map="auto")' in card_text
         assert "My Trainer" in card_text
 
 
@@ -502,6 +587,82 @@ class TestRepeatRandomSampler(TrlTestCase):
         assert sampled[24:28] == sampled[28:32] == sampled[32:36]
 
 
+class TestRepeatIterableDataset(TrlTestCase):
+    @staticmethod
+    def _make_dataset(n):
+        return IterableDataset.from_generator(lambda: ({"x": i} for i in range(n)))
+
+    @pytest.mark.parametrize("mini_repeat_count,batch_size,repeat_count", [(1, 1, 1), (2, 3, 4), (3, 2, 2), (2, 2, 3)])
+    def test_matches_repeat_sampler(self, mini_repeat_count, batch_size, repeat_count):
+        # The streaming transform must yield records in exactly the same order as RepeatSampler yields indices for a
+        # map-style dataset (unshuffled), across a representative range of arguments.
+        n = 12
+        expected = list(
+            RepeatSampler(
+                list(range(n)),
+                mini_repeat_count=mini_repeat_count,
+                batch_size=batch_size,
+                repeat_count=repeat_count,
+                shuffle=False,
+            )
+        )
+        actual = [
+            record["x"]
+            for record in repeat_iterable_dataset(
+                self._make_dataset(n),
+                mini_repeat_count=mini_repeat_count,
+                batch_size=batch_size,
+                repeat_count=repeat_count,
+            )
+        ]
+        assert actual == expected
+
+    def test_default_arguments(self):
+        dataset = self._make_dataset(4)
+        sampled = [record["x"] for record in repeat_iterable_dataset(dataset, mini_repeat_count=2)]
+        assert sampled == [0, 0, 1, 1, 2, 2, 3, 3]
+
+    def test_drops_incomplete_batch(self):
+        dataset = self._make_dataset(7)
+        sampled = [record["x"] for record in repeat_iterable_dataset(dataset, mini_repeat_count=1, batch_size=2)]
+        # The last element is dropped because it can't form a full batch of size 2.
+        assert sampled == [0, 1, 2, 3, 4, 5]
+
+    def test_preserves_all_columns(self):
+        dataset = IterableDataset.from_generator(lambda: ({"x": i, "answer": str(i)} for i in range(2)))
+        sampled = list(repeat_iterable_dataset(dataset, mini_repeat_count=2))
+        assert sampled == [
+            {"x": 0, "answer": "0"},
+            {"x": 0, "answer": "0"},
+            {"x": 1, "answer": "1"},
+            {"x": 1, "answer": "1"},
+        ]
+
+    def test_repeats_are_independent_objects(self):
+        # Repeated records must be independent objects (like the map-style path, where the dataset re-materializes a
+        # fresh object per access), so an in-place edit to one repeat doesn't corrupt the others.
+        dataset = IterableDataset.from_generator(lambda: ({"prompt": [{"content": "hi"}]} for _ in range(1)))
+        sampled = list(repeat_iterable_dataset(dataset, mini_repeat_count=2))
+        assert sampled[0] is not sampled[1]
+        assert sampled[0]["prompt"] is not sampled[1]["prompt"]
+        sampled[0]["prompt"][-1]["content"] += " there"
+        assert sampled[1]["prompt"][-1]["content"] == "hi"
+
+    def test_reshuffles_across_epochs(self):
+        # The transform stays chained to the source, so `set_epoch` reaches an upstream `shuffle` and the order is
+        # reshuffled every epoch, matching RepeatSampler (whose RNG advances on each `__iter__`).
+        dataset = IterableDataset.from_generator(lambda: ({"x": i} for i in range(8))).shuffle(seed=42)
+        repeated = repeat_iterable_dataset(dataset, mini_repeat_count=1, batch_size=8)
+
+        repeated.set_epoch(0)
+        epoch_0 = [record["x"] for record in repeated]
+        repeated.set_epoch(1)
+        epoch_1 = [record["x"] for record in repeated]
+
+        assert sorted(epoch_0) == sorted(epoch_1) == list(range(8))  # same content
+        assert epoch_0 != epoch_1  # different order
+
+
 class TestEntropyFromLogits(TrlTestCase):
     @pytest.mark.parametrize("shape", [(768,), (32, 768), (8, 16, 768), (2, 4, 8, 768)])
     @pytest.mark.parametrize("chunk_size", [1, 16])
@@ -546,6 +707,36 @@ class TestPrintPromptCompletionsSample(TrlTestCase):
         """)
 
         assert output == expected_output
+
+    @patch("sys.stdout", new_callable=StringIO)
+    def test_no_advantages(self, mock_stdout):
+        # When `advantages` is None, the Advantage column is omitted (e.g. distillation, which has no advantages).
+        prompts = ["The sky is", "The sun is"]
+        completions = [" blue.", " in the sky."]
+        rewards = {"Correctness": [0.123, 0.456]}
+        step = 42
+
+        print_prompt_completions_sample(prompts, completions, rewards, None, step)
+
+        output = mock_stdout.getvalue()
+        assert "Prompt" in output
+        assert "Completion" in output
+        assert "Correctness" in output
+        assert "Advantage" not in output
+
+    @patch("sys.stdout", new_callable=StringIO)
+    def test_no_rewards_no_advantages(self, mock_stdout):
+        # Prompt/completion-only table: empty rewards and `advantages=None` (the distillation case).
+        prompts = ["The sky is", "The sun is"]
+        completions = [" blue.", " in the sky."]
+        step = 42
+
+        print_prompt_completions_sample(prompts, completions, {}, None, step)
+
+        output = mock_stdout.getvalue()
+        assert "Prompt" in output
+        assert "Completion" in output
+        assert "Advantage" not in output
 
     @patch("sys.stdout", new_callable=StringIO)
     def test_extra_columns(self, mock_stdout):
@@ -773,6 +964,96 @@ class TestSelectiveLogSoftmax(TrlTestCase):
         else:
             torch.testing.assert_close(actual_output, expected_output, rtol=1e-5, atol=1e-5)
 
+    @pytest.mark.parametrize(
+        "error", [pytest.param(None, id="success"), pytest.param(OSError("offline"), id="failure")]
+    )
+    def test_hub_kernel_load_is_cached(self, error):
+        kernel = types.ModuleType("trl_losses")
+        kernels = types.ModuleType("kernels")
+        kernels.get_kernel = Mock(return_value=kernel, side_effect=error)
+        expected = None if error is not None else kernel
+
+        with (
+            patch.dict(sys.modules, {"kernels": kernels}),
+            patch("trl.trainer.utils.is_kernels_available", return_value=True),
+            patch("trl.trainer.utils._TRL_LOSS_KERNEL", None),
+            patch("trl.trainer.utils._TRL_LOSS_KERNEL_LOAD_ATTEMPTED", False),
+        ):
+            assert trainer_utils._load_trl_loss_kernel() is expected
+            # Cache failures too, otherwise an offline run retries Hub I/O every training step.
+            assert trainer_utils._load_trl_loss_kernel() is expected
+
+        kernels.get_kernel.assert_called_once_with("trl-lib/trl-losses", version=0, trust_remote_code=True)
+
+    @require_torch_accelerator
+    def test_hub_kernel_dispatch(self):
+        def fused_logprobs_and_entropy(logits, index, temperature=1.0, row_mask=None):
+            logprobs = (logits.float() / temperature).log_softmax(-1)
+            selected_logprobs = logprobs.gather(-1, index.unsqueeze(-1)).squeeze(-1)
+            entropy = -(logprobs.exp() * logprobs).sum(-1)
+            if row_mask is not None:
+                selected_logprobs = selected_logprobs.masked_fill(row_mask == 0, 0.0)
+                entropy = entropy.masked_fill(row_mask == 0, 0.0)
+            return selected_logprobs, entropy
+
+        kernel = types.SimpleNamespace(selective_log_softmax_and_entropy=Mock(side_effect=fused_logprobs_and_entropy))
+        logits = torch.randn(2, 3, 257, device=torch_device, dtype=torch.bfloat16, requires_grad=True)
+        index = torch.randint(257, (2, 3), device=torch_device)
+        row_mask = torch.tensor([[1, 0, 1], [0, 1, 1]], device=torch_device, dtype=torch.bool)
+
+        with patch("trl.trainer.utils._load_trl_loss_kernel", return_value=kernel):
+            logprobs = selective_log_softmax(logits, index, temperature=0.7, row_mask=row_mask)
+            entropy = entropy_from_logits(logits)
+            combined_logprobs, combined_entropy = selective_log_softmax_and_entropy(
+                logits, index, entropy_requires_grad=False, temperature=0.7, row_mask=row_mask
+            )
+
+        torch.testing.assert_close(logprobs, combined_logprobs)
+        expected_entropy = fused_logprobs_and_entropy(logits, index, temperature=0.7, row_mask=row_mask)[1]
+        torch.testing.assert_close(combined_entropy, expected_entropy)
+        assert torch.all(entropy > 0)
+        assert combined_logprobs.requires_grad
+        assert not combined_entropy.requires_grad
+        combined_logprobs.sum().backward()
+        assert logits.grad is not None
+        assert kernel.selective_log_softmax_and_entropy.call_count == 3
+
+    def test_temperature_and_row_mask_fallback(self):
+        logits = torch.randn(2, 3, 257, requires_grad=True)
+        index = torch.randint(257, (2, 3))
+        row_mask = torch.tensor([[1, 0, 1], [0, 1, 1]], dtype=torch.bool)
+
+        logprobs, entropy = selective_log_softmax_and_entropy(logits, index, temperature=0.7, row_mask=row_mask)
+        (logprobs + 0.1 * entropy).sum().backward()
+
+        reference_logits = logits.detach().clone().requires_grad_()
+        reference_logprobs = (reference_logits / 0.7).log_softmax(-1)
+        reference_entropy = -(reference_logprobs.exp() * reference_logprobs).sum(-1)
+        reference_logprobs = reference_logprobs.gather(-1, index.unsqueeze(-1)).squeeze(-1)
+        reference_logprobs = reference_logprobs.masked_fill(~row_mask, 0.0)
+        reference_entropy = reference_entropy.masked_fill(~row_mask, 0.0)
+        (reference_logprobs + 0.1 * reference_entropy).sum().backward()
+
+        torch.testing.assert_close(logprobs, reference_logprobs)
+        torch.testing.assert_close(entropy, reference_entropy)
+        torch.testing.assert_close(logits.grad, reference_logits.grad)
+        assert torch.count_nonzero(logits.grad[~row_mask]) == 0
+
+    @require_torch_accelerator
+    def test_torch_compile_does_not_load_hub_kernel(self):
+        logits = torch.randn(2, 3, 257, device=torch_device, requires_grad=True)
+        index = torch.randint(257, (2, 3), device=torch_device)
+
+        with (
+            patch("trl.trainer.utils.is_kernels_available", side_effect=AssertionError("unexpected Hub lookup")),
+            patch("trl.trainer.utils._TRL_LOSS_KERNEL", None),
+            patch("trl.trainer.utils._TRL_LOSS_KERNEL_LOAD_ATTEMPTED", False),
+        ):
+            torch.compile(selective_log_softmax, fullgraph=True)(logits, index).sum().backward()
+            assert not trainer_utils._TRL_LOSS_KERNEL_LOAD_ATTEMPTED
+
+        assert logits.grad is not None
+
     @pytest.mark.parametrize("dtype", [torch.float64, torch.float32, torch.float16, torch.bfloat16])
     @pytest.mark.parametrize("k", [1, 8])
     def test_selective_log_softmax_multi_index(self, dtype, k):
@@ -980,6 +1261,52 @@ class TestSplitPixelValuesByGrid(TrlTestCase):
         assert torch.equal(result["image_position_ids"][0], batch["image_position_ids"][:1])
         assert torch.equal(result["image_position_ids"][1], batch["image_position_ids"][1:])
 
+    def test_split_by_spatial_shapes(self):
+        batch = {
+            "num_images": [2, 1],
+            "num_tiles": [3, 2],
+            "pixel_values": torch.arange(5 * 4).reshape(5, 4),
+            "pixel_attention_mask": torch.arange(5 * 6).reshape(5, 6),
+            "spatial_shapes": torch.arange(5 * 2).reshape(5, 2),
+        }
+        result = split_pixel_values_by_grid(batch)
+        assert isinstance(result["pixel_values"], list)
+        assert len(result["pixel_values"]) == 2
+        assert torch.equal(result["pixel_values"][0], batch["pixel_values"][:3])
+        assert torch.equal(result["pixel_values"][1], batch["pixel_values"][3:])
+        assert isinstance(result["pixel_attention_mask"], list)
+        assert torch.equal(result["pixel_attention_mask"][0], batch["pixel_attention_mask"][:3])
+        assert torch.equal(result["pixel_attention_mask"][1], batch["pixel_attention_mask"][3:])
+        assert isinstance(result["spatial_shapes"], list)
+        assert torch.equal(result["spatial_shapes"][0], batch["spatial_shapes"][:3])
+        assert torch.equal(result["spatial_shapes"][1], batch["spatial_shapes"][3:])
+
+    def test_split_without_grid_metadata(self):
+        # LLaVA-style: no grid metadata at all, pixel_values and image_sizes are indexed by image
+        batch = {
+            "num_images": [1, 2],
+            "pixel_values": torch.arange(3 * 4).reshape(3, 4),
+            "image_sizes": torch.tensor([[8, 8], [4, 4], [2, 2]]),
+        }
+        result = split_pixel_values_by_grid(batch)
+        assert isinstance(result["pixel_values"], list)
+        assert len(result["pixel_values"]) == 2
+        assert torch.equal(result["pixel_values"][0], batch["pixel_values"][:1])
+        assert torch.equal(result["pixel_values"][1], batch["pixel_values"][1:])
+        assert isinstance(result["image_sizes"], list)
+        assert len(result["image_sizes"]) == 2
+        assert torch.equal(result["image_sizes"][0], batch["image_sizes"][:1])
+        assert torch.equal(result["image_sizes"][1], batch["image_sizes"][1:])
+
+    def test_no_split_when_padded_by_sample(self):
+        # Idefics-style: pixel_values is padded to (num_samples, max_num_images, ...), already sample-indexed
+        batch = {
+            "num_images": [1, 2],
+            "pixel_values": torch.arange(2 * 2 * 4).reshape(2, 2, 4),
+        }
+        result = split_pixel_values_by_grid(batch)
+        assert result == batch
+
 
 class TestUnsplitPixelValuesByGrid(TrlTestCase):
     def test_unsplit_correctly(self):
@@ -1004,6 +1331,31 @@ class TestUnsplitPixelValuesByGrid(TrlTestCase):
         assert isinstance(result["image_position_ids"], torch.Tensor)
         assert torch.equal(result["image_position_ids"], image_position_ids_merged)
 
+    def test_unsplit_spatial_shapes(self):
+        pixel_values = [torch.randn(3, 4), torch.randn(2, 4)]
+        pixel_attention_mask = [torch.randn(3, 6), torch.randn(2, 6)]
+        spatial_shapes = [torch.tensor([[1, 2], [3, 4], [5, 6]]), torch.tensor([[7, 8], [9, 10]])]
+        batch = {
+            "pixel_values": pixel_values,
+            "pixel_attention_mask": pixel_attention_mask,
+            "spatial_shapes": spatial_shapes,
+        }
+        result = unsplit_pixel_values_by_grid(batch)
+        assert isinstance(result["pixel_values"], torch.Tensor)
+        torch.testing.assert_close(result["pixel_values"], torch.cat(pixel_values, dim=0))
+        assert isinstance(result["pixel_attention_mask"], torch.Tensor)
+        torch.testing.assert_close(result["pixel_attention_mask"], torch.cat(pixel_attention_mask, dim=0))
+        assert isinstance(result["spatial_shapes"], torch.Tensor)
+        assert torch.equal(result["spatial_shapes"], torch.cat(spatial_shapes, dim=0))
+
+    def test_unsplit_image_sizes(self):
+        pixel_values = [torch.randn(1, 4), torch.randn(2, 4)]
+        image_sizes = [torch.tensor([[8, 8]]), torch.tensor([[4, 4], [2, 2]])]
+        batch = {"pixel_values": pixel_values, "image_sizes": image_sizes}
+        result = unsplit_pixel_values_by_grid(batch)
+        assert isinstance(result["image_sizes"], torch.Tensor)
+        assert torch.equal(result["image_sizes"], torch.cat(image_sizes, dim=0))
+
     def test_no_op_if_not_list(self):
         original = torch.randn(5, 3)
         batch = {"pixel_values": original}
@@ -1015,8 +1367,16 @@ class TestChunkedLogProbFunction:
     N, H, V = 64, 32, 128
     CHUNK_SIZE = 32
 
-    def _reference_logprobs_and_entropy(self, hidden, weight, labels, temperature):
-        logits = (hidden @ weight.t()).to(torch.float32) / temperature  # [N, V]
+    def _reference_logprobs_and_entropy(
+        self, hidden, weight, labels, temperature, bias=None, logit_scale=1.0, final_logit_softcapping=None
+    ):
+        logits = hidden @ weight.t()
+        if bias is not None:
+            logits = logits + bias
+        logits = logits.to(torch.float32) * logit_scale
+        if final_logit_softcapping is not None:
+            logits = torch.tanh(logits / final_logit_softcapping) * final_logit_softcapping
+        logits = logits / temperature  # [N, V]
         log_p = F.log_softmax(logits, dim=-1)
         logprobs = log_p.gather(-1, labels.unsqueeze(-1)).squeeze(-1)
         p = torch.softmax(logits, dim=-1)
@@ -1029,14 +1389,50 @@ class TestChunkedLogProbFunction:
         hidden = torch.randn(self.N, self.H)
         weight = torch.randn(self.V, self.H)
         labels = torch.randint(0, self.V, (self.N,))
+        chunk_rows = []
+        torch_mm = torch.mm
 
-        logprobs_chunked, entropy_chunked = _ChunkedLogProbFunction.apply(
-            hidden, weight, labels, temperature, self.CHUNK_SIZE
-        )
+        def record_chunk(input, mat2, *, out=None):
+            chunk_rows.append(input.size(0))
+            return torch_mm(input, mat2, out=out)
+
+        with (
+            patch("trl.trainer.utils._CHUNKED_LOGPROB_TOKEN_CHUNK_SIZE", 17),
+            patch("trl.trainer.utils.torch.mm", side_effect=record_chunk),
+        ):
+            logprobs_chunked, entropy_chunked = _ChunkedLogProbFunction.apply(
+                hidden, weight, None, labels, temperature, self.CHUNK_SIZE
+            )
         logprobs_ref, entropy_ref = self._reference_logprobs_and_entropy(hidden, weight, labels, temperature)
 
         torch.testing.assert_close(logprobs_chunked, logprobs_ref, atol=1e-5, rtol=1e-5)
         torch.testing.assert_close(entropy_chunked, entropy_ref, atol=1e-5, rtol=1e-5)
+        assert max(chunk_rows) <= 17
+        assert chunk_rows[-1] == 13
+
+    @pytest.mark.parametrize(
+        ("logit_scale", "final_logit_softcapping"),
+        [
+            (0.5, None),  # models that scale but don't softcap, e.g. MPT
+            (1.0, 30.0),  # models that softcap but don't scale, e.g. Gemma 2
+            (0.5, 30.0),  # both, applied in that order
+        ],
+    )
+    def test_logit_scale_and_softcapping(self, logit_scale, final_logit_softcapping):
+        torch.manual_seed(42)
+        hidden = torch.randn(self.N, self.H)
+        weight = torch.randn(self.V, self.H)
+        labels = torch.randint(0, self.V, (self.N,))
+
+        logprobs, entropy = _ChunkedLogProbFunction.apply(
+            hidden, weight, None, labels, 0.7, self.CHUNK_SIZE, final_logit_softcapping, logit_scale
+        )
+        logprobs_ref, entropy_ref = self._reference_logprobs_and_entropy(
+            hidden, weight, labels, 0.7, logit_scale=logit_scale, final_logit_softcapping=final_logit_softcapping
+        )
+
+        torch.testing.assert_close(logprobs, logprobs_ref, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(entropy, entropy_ref, atol=1e-5, rtol=1e-5)
 
     @pytest.mark.parametrize("temperature", [1.0, 0.7])
     def test_backward(self, temperature):
@@ -1046,7 +1442,7 @@ class TestChunkedLogProbFunction:
         labels = torch.randint(0, self.V, (self.N,))
 
         # Chunked backward
-        logprobs_chunked, _ = _ChunkedLogProbFunction.apply(hidden, weight, labels, temperature, self.CHUNK_SIZE)
+        logprobs_chunked, _ = _ChunkedLogProbFunction.apply(hidden, weight, None, labels, temperature, self.CHUNK_SIZE)
         logprobs_chunked.sum().backward()
         grad_hidden_chunked = hidden.grad.clone()
         grad_weight_chunked = weight.grad.clone()
@@ -1069,7 +1465,7 @@ class TestChunkedLogProbFunction:
         labels = torch.randint(0, self.V, (self.N,))
 
         # Chunked backward
-        logprobs_chunked, _ = _ChunkedLogProbFunction.apply(hidden, weight, labels, temperature, self.CHUNK_SIZE)
+        logprobs_chunked, _ = _ChunkedLogProbFunction.apply(hidden, weight, None, labels, temperature, self.CHUNK_SIZE)
         logprobs_chunked.sum().backward()
         grad_hidden_chunked = hidden.grad.clone()
         grad_weight_chunked = weight.grad.clone()
@@ -1083,6 +1479,166 @@ class TestChunkedLogProbFunction:
 
         torch.testing.assert_close(grad_hidden_chunked, hidden.grad, atol=1e-2, rtol=1e-2)
         torch.testing.assert_close(grad_weight_chunked, weight.grad, atol=1e-2, rtol=1e-2)
+
+    def test_backward_bfloat16_hidden_float32_weight(self):
+        torch.manual_seed(42)
+        hidden = torch.randn(self.N, self.H, dtype=torch.bfloat16, requires_grad=True)
+        weight = torch.randn(self.V, self.H, dtype=torch.float32, requires_grad=True)
+        labels = torch.randint(0, self.V, (self.N,))
+
+        logprobs, _ = _ChunkedLogProbFunction.apply(hidden, weight, None, labels, 1.0, self.CHUNK_SIZE)
+        logprobs.sum().backward()
+        grad_hidden = hidden.grad.clone()
+        grad_weight = weight.grad.clone()
+
+        hidden.grad = None
+        weight.grad = None
+        reference, _ = self._reference_logprobs_and_entropy(hidden, weight.to(hidden.dtype), labels, 1.0)
+        reference.sum().backward()
+
+        torch.testing.assert_close(logprobs, reference, atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(grad_hidden, hidden.grad, atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(grad_weight, weight.grad, atol=1e-2, rtol=1e-2)
+
+    def test_backward_uses_autocast_hidden_for_weight_gradient(self):
+        torch.manual_seed(42)
+        hidden = torch.linspace(1.0, 2.0, self.N * self.H).reshape(self.N, self.H).to(torch.bfloat16).float()
+        perturbed_hidden = hidden + 1e-4
+        assert torch.equal(hidden.to(torch.bfloat16), perturbed_hidden.to(torch.bfloat16))
+        hidden.requires_grad_()
+        perturbed_hidden.requires_grad_()
+        weight = torch.randn(self.V, self.H, requires_grad=True)
+        perturbed_weight = weight.detach().clone().requires_grad_()
+        labels = torch.randint(0, self.V, (self.N,))
+
+        # Autocast gives both inputs identical projected values. Their weight gradients must therefore also match;
+        # using the original fp32 hidden states in backward would make the gradients depend on the discarded bits.
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            logprobs, _ = _ChunkedLogProbFunction.apply(hidden, weight, None, labels, 1.0, self.CHUNK_SIZE)
+            perturbed_logprobs, _ = _ChunkedLogProbFunction.apply(
+                perturbed_hidden, perturbed_weight, None, labels, 1.0, self.CHUNK_SIZE
+            )
+        logprobs.sum().backward()
+        perturbed_logprobs.sum().backward()
+
+        torch.testing.assert_close(logprobs, perturbed_logprobs, rtol=0, atol=0)
+        torch.testing.assert_close(weight.grad, perturbed_weight.grad, rtol=0, atol=0)
+
+    @pytest.mark.parametrize("temperature", [1.0, 0.7])
+    def test_backward_entropy(self, temperature):
+        """Backprop through the `entropy` output alone (as opposed to `logprobs`, covered above)."""
+        torch.manual_seed(42)
+        hidden = torch.randn(self.N, self.H, requires_grad=True)
+        weight = torch.randn(self.V, self.H, requires_grad=True)
+        labels = torch.randint(0, self.V, (self.N,))
+
+        # Chunked backward
+        _, entropy_chunked = _ChunkedLogProbFunction.apply(hidden, weight, None, labels, temperature, self.CHUNK_SIZE)
+        entropy_chunked.sum().backward()
+        grad_hidden_chunked = hidden.grad.clone()
+        grad_weight_chunked = weight.grad.clone()
+
+        hidden.grad = None
+        weight.grad = None
+
+        # Reference backward
+        _, entropy_ref = self._reference_logprobs_and_entropy(hidden, weight, labels, temperature)
+        entropy_ref.sum().backward()
+
+        torch.testing.assert_close(grad_hidden_chunked, hidden.grad, atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(grad_weight_chunked, weight.grad, atol=1e-4, rtol=1e-4)
+
+    @pytest.mark.parametrize("temperature", [1.0, 0.7])
+    def test_backward_combined(self, temperature):
+        """Backprop through `logprobs` and `entropy` together, to catch the gradients overwriting each other
+        instead of accumulating."""
+        torch.manual_seed(42)
+        hidden = torch.randn(self.N, self.H, requires_grad=True)
+        weight = torch.randn(self.V, self.H, requires_grad=True)
+        labels = torch.randint(0, self.V, (self.N,))
+
+        # Chunked backward
+        with patch("trl.trainer.utils._CHUNKED_LOGPROB_TOKEN_CHUNK_SIZE", 17):
+            logprobs_chunked, entropy_chunked = _ChunkedLogProbFunction.apply(
+                hidden, weight, None, labels, temperature, self.CHUNK_SIZE
+            )
+            (2.0 * logprobs_chunked + 0.5 * entropy_chunked).sum().backward()
+        grad_hidden_chunked = hidden.grad.clone()
+        grad_weight_chunked = weight.grad.clone()
+
+        hidden.grad = None
+        weight.grad = None
+
+        # Reference backward
+        logprobs_ref, entropy_ref = self._reference_logprobs_and_entropy(hidden, weight, labels, temperature)
+        (2.0 * logprobs_ref + 0.5 * entropy_ref).sum().backward()
+
+        torch.testing.assert_close(grad_hidden_chunked, hidden.grad, atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(grad_weight_chunked, weight.grad, atol=1e-4, rtol=1e-4)
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_bias(self, dtype):
+        torch.manual_seed(42)
+        hidden = torch.randn(self.N, self.H, dtype=dtype, requires_grad=True)
+        weight = torch.randn(self.V, self.H, dtype=dtype, requires_grad=True)
+        bias = torch.randn(self.V, dtype=dtype, requires_grad=True)
+        labels = torch.randint(0, self.V, (self.N,))
+
+        logprobs_chunked, entropy_chunked = _ChunkedLogProbFunction.apply(
+            hidden, weight, bias, labels, 0.7, self.CHUNK_SIZE
+        )
+        (2.0 * logprobs_chunked + 0.5 * entropy_chunked).sum().backward()
+        chunked_grads = hidden.grad.clone(), weight.grad.clone(), bias.grad.clone()
+
+        hidden.grad = weight.grad = bias.grad = None
+        logprobs_ref, entropy_ref = self._reference_logprobs_and_entropy(hidden, weight, labels, 0.7, bias)
+        (2.0 * logprobs_ref + 0.5 * entropy_ref).sum().backward()
+
+        atol, rtol = (5e-2, 2e-2) if dtype == torch.bfloat16 else (1e-4, 1e-4)
+        torch.testing.assert_close(logprobs_chunked, logprobs_ref, atol=atol, rtol=rtol)
+        torch.testing.assert_close(entropy_chunked, entropy_ref, atol=atol, rtol=rtol)
+        for actual, expected in zip(chunked_grads, (hidden.grad, weight.grad, bias.grad), strict=True):
+            torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+
+    def test_backward_skips_frozen_parameter_gradients(self):
+        torch.manual_seed(42)
+        hidden = torch.randn(self.N, self.H, requires_grad=True)
+        weight = torch.randn(self.V, self.H)
+        bias = torch.randn(self.V)
+        labels = torch.randint(0, self.V, (self.N,))
+
+        logprobs, _ = _ChunkedLogProbFunction.apply(hidden, weight, bias, labels, 1.0, self.CHUNK_SIZE)
+        with patch.object(torch, "zeros", wraps=torch.zeros) as mock_zeros:
+            logprobs.sum().backward()
+
+        # A frozen LM head should not allocate full-vocabulary gradient buffers. These shapes are distinct from the
+        # per-token accumulators and the hidden-state gradient allocated by the same backward pass.
+        allocated_shapes = [call.args[0] for call in mock_zeros.call_args_list]
+        assert weight.shape not in allocated_shapes
+        assert bias.shape not in allocated_shapes
+        assert hidden.grad is not None
+
+    @pytest.mark.parametrize("requires_grad", [(True, False, False), (False, True, False), (False, False, True)])
+    def test_backward_with_partially_frozen_inputs(self, requires_grad):
+        torch.manual_seed(42)
+        hidden = torch.randn(self.N, self.H, requires_grad=requires_grad[0])
+        weight = torch.randn(self.V, self.H, requires_grad=requires_grad[1])
+        bias = torch.randn(self.V, requires_grad=requires_grad[2])
+        labels = torch.randint(0, self.V, (self.N,))
+
+        logprobs, _ = _ChunkedLogProbFunction.apply(hidden, weight, bias, labels, 1.0, self.CHUNK_SIZE)
+        logprobs.sum().backward()
+        chunked_grads = hidden.grad, weight.grad, bias.grad
+
+        hidden_ref = hidden.detach().clone().requires_grad_(requires_grad[0])
+        weight_ref = weight.detach().clone().requires_grad_(requires_grad[1])
+        bias_ref = bias.detach().clone().requires_grad_(requires_grad[2])
+        logprobs_ref, _ = self._reference_logprobs_and_entropy(hidden_ref, weight_ref, labels, 1.0, bias_ref)
+        logprobs_ref.sum().backward()
+
+        for actual, expected in zip(chunked_grads, (hidden_ref.grad, weight_ref.grad, bias_ref.grad), strict=True):
+            if expected is not None:
+                torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
 
 
 class _FakeTransformerModel(nn.Module):
@@ -1106,7 +1662,7 @@ class _FakeCausalLM(nn.Module):
 
     def __init__(self, hidden_size, vocab_size):
         super().__init__()
-        self.config = type("Config", (), {})()
+        self.config = PretrainedConfig()
         self.model = _FakeTransformerModel(hidden_size)
         self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
 
@@ -1135,6 +1691,14 @@ _CHUNKED_LM_HEAD_MODEL_IDS = [
     "trl-internal-testing/tiny-GemmaForCausalLM",
     "trl-internal-testing/tiny-Glm4MoeForCausalLM",
     "trl-internal-testing/tiny-GptOssForCausalLM",
+    "trl-internal-testing/tiny-Lfm2ForCausalLM",
+    pytest.param(
+        "trl-internal-testing/tiny-Lfm2ForCausalLM-2.5",
+        marks=pytest.mark.skipif(
+            Version(transformers.__version__) < Version("5.0.0"),
+            reason="LFM2.5 tokenizer requires transformers>=5.0.0",
+        ),
+    ),
     "trl-internal-testing/tiny-LlamaForCausalLM-3.1",
     "trl-internal-testing/tiny-LlamaForCausalLM-3.2",
     "trl-internal-testing/tiny-LlamaForCausalLM-3",
@@ -1242,10 +1806,24 @@ class TestPatchChunkedLMHead:
 
         torch.testing.assert_close(grad_weight_masked, grad_weight_full, atol=1e-5, rtol=1e-5)
 
+        model.lm_head.weight.grad = None
+        model.model._hidden = None
+        empty_completion_mask = torch.zeros_like(completion_mask)
+        out_empty = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=input_ids,
+            completion_mask=empty_completion_mask,
+        )
+        assert out_empty["log_probs"].count_nonzero() == 0
+        out_empty["log_probs"].sum().backward()
+        assert model.lm_head.weight.grad is not None
+        assert model.lm_head.weight.grad.count_nonzero() == 0
+
     @pytest.mark.parametrize("model_id", _CHUNKED_LM_HEAD_MODEL_IDS)
     @pytest.mark.parametrize("temperature", [1.0, 0.7])
     def test_forward(self, model_id, temperature):
-        model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.bfloat16).to(torch_device)
+        model = AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.bfloat16).to(torch_device)
         model.eval()
 
         B, S, chunk_size = 2, 8, 32
@@ -1273,7 +1851,13 @@ class TestPatchChunkedLMHead:
     @pytest.mark.parametrize("model_id", _CHUNKED_LM_HEAD_MODEL_IDS)
     @pytest.mark.parametrize("temperature", [1.0, 0.7])
     def test_backward(self, model_id, temperature):
-        model_ref = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.bfloat16).to(torch_device)
+        # Run in float32, not bfloat16. For models that tie their embeddings, `lm_head.weight.grad` is the sum of the
+        # LM-head projection and the input-embedding lookup, so its absolute error is set by the larger of the two
+        # rather than by the element's own value. In bfloat16 that error (~1 ULP at the gradient's scale) swamps the
+        # assertion: every untied model lands on the same ~1.6e-2 bf16 quantum, and the tied ones range up to ~4e-1,
+        # which no useful tolerance can separate from a real bug. float32 drops the worst case to ~3e-5 and makes the
+        # test sensitive to the thing it is meant to check: that the chunked gradient matches the reference.
+        model_ref = AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.float32).to(torch_device)
         model_chunked = copy.deepcopy(model_ref)
 
         B, S, chunk_size = 2, 8, 32
@@ -1295,7 +1879,7 @@ class TestPatchChunkedLMHead:
         out["log_probs"].sum().backward()
         chunked_grad = model_chunked.lm_head.weight.grad.clone()
 
-        torch.testing.assert_close(chunked_grad, ref_grad, atol=5e-2, rtol=5e-2)
+        torch.testing.assert_close(chunked_grad, ref_grad, atol=1e-3, rtol=1e-3)
 
 
 class TestComputeFlopsPerToken(TrlTestCase):
@@ -1336,6 +1920,14 @@ class TestComputeFlopsPerToken(TrlTestCase):
         per_expert_per_layer = 2 * 3 * cfg.hidden_size * cfg.moe_intermediate_size
         expected_delta = 3 * moe_layers * (2 - 1) * per_expert_per_layer
         assert f_hi - f_lo == expected_delta
+
+    def test_config_without_head_dim(self):
+        # `head_dim` is optional on configs: Qwen2 doesn't declare it. Falling back to `hidden_size //
+        # num_attention_heads` must give the same result as setting it explicitly.
+        cfg = AutoConfig.from_pretrained("trl-internal-testing/tiny-Qwen2ForCausalLM-2.5")
+        derived = compute_flops_per_token(cfg, 16384)
+        cfg.head_dim = cfg.hidden_size // cfg.num_attention_heads
+        assert compute_flops_per_token(cfg, 16384) == derived
 
 
 class TestComputeMfu(TrlTestCase):
@@ -1378,3 +1970,11 @@ class TestAdjustedMfu(TrlTestCase):
         f_med = adjusted_mfu(100.0, cfg, 16384)
         f_long = adjusted_mfu(100.0, cfg, 65536)
         assert f_short > f_med > f_long
+
+    def test_config_without_head_dim(self):
+        # `head_dim` is optional on configs: Qwen2 doesn't declare it. Falling back to `hidden_size //
+        # num_attention_heads` must give the same result as setting it explicitly.
+        cfg = AutoConfig.from_pretrained("trl-internal-testing/tiny-Qwen2ForCausalLM-2.5")
+        derived = adjusted_mfu(100.0, cfg, 16384)
+        cfg.head_dim = cfg.hidden_size // cfg.num_attention_heads
+        assert adjusted_mfu(100.0, cfg, 16384) == pytest.approx(derived)

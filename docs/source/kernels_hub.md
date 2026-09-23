@@ -19,6 +19,8 @@ pip install kernels
 
 Kernels can directly replace attention implementations, removing the need to manually compile attention backends like Flash Attention and boosting training speed just by pulling the respective attention kernel from the Hub.
 
+The source for TRL's fused loss kernel is maintained in the repository's [`kernels/` directory](https://github.com/huggingface/trl/tree/main/kernels). When `kernels` is installed and a compatible `trl-lib/trl-losses` Hub build is available, TRL loads it automatically for DPO, GRPO, KTO, RLOO, and TPO. The existing PyTorch implementation remains the fallback when the optional build is unavailable. Builds are published by the repository's `publish-kernels` workflow after changes to `kernels/` land on `main`.
+
 You can specify a kernel when loading a model:
 
 
@@ -45,6 +47,29 @@ trl sft ... --attn_implementation kernels-community/flash-attn2
 
 > [!TIP]
 > Now you can leverage faster attention backends with a pre-optimized kernel for your hardware configuration from the Hub, speeding up both development and training.
+
+## Choosing and Pinning a Kernel Version
+
+Kernel repositories on the Hub are versioned as branches (`v1`, `v2`, `v3`, ...), and Transformers selects a default version for each repository. That default can change from one Transformers release to the next, so the same `attn_implementation` value does not always resolve to the same build.
+
+To control which build is loaded, append a revision to the repository id, either a version branch or a commit SHA:
+
+```python
+from transformers import AutoModelForCausalLM
+
+model = AutoModelForCausalLM.from_pretrained(
+    "your-model-name",
+    attn_implementation="kernels-community/flash-attn2@v2",  # or a commit SHA to pin an exact build
+)
+```
+
+Pinning is useful to make a training run reproducible, and to stay on a known-good build when a newer one regresses. Keep in mind that each version only ships builds for a range of Torch and CUDA versions, so a pinned version may have no variant for your environment.
+
+> [!TIP]
+> `attn_implementation="flash_attention_2"` falls back to the `kernels-community/flash-attn2` Hub kernel when the `flash-attn` package is not installed, so you may be using a Hub kernel without having asked for one explicitly.
+
+> [!WARNING]
+> The `v3` builds for CUDA 12.8 currently fail in the backward pass for models using grouped-query attention. If your environment uses that CUDA version, pin `@v2` until [huggingface/kernels-community#1085](https://github.com/huggingface/kernels-community/issues/1085) is closed.
 
 ## Comparing Attention Implementations
 
@@ -93,4 +118,4 @@ training_args = SFTConfig(
 )
 ```
 
-Learn more about the [Liger Kernel Integration](./liger_kernel_integration).
+Learn more about the [Liger Kernel Integration](liger_kernel_integration).
