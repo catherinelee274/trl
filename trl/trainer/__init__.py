@@ -38,6 +38,8 @@ _import_structure = {
     "rloo_trainer": ["RLOOTrainer"],
     "sft_config": ["SFTConfig"],
     "sft_trainer": ["SFTTrainer"],
+    "vpo_config": ["VPOConfig"],
+    "vpo_trainer": ["VPOTrainer"],
     "utils": [
         "disable_dropout_in_model",
         "ensure_master_addr_port",
@@ -77,6 +79,8 @@ if TYPE_CHECKING:
         get_quantization_config,
         patch_chunked_lm_head,
     )
+    from .vpo_config import VPOConfig
+    from .vpo_trainer import VPOTrainer
 else:
     import sys
 
