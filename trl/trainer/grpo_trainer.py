@@ -553,13 +553,15 @@ class GRPOTrainer(_BaseTrainer):
         if is_peft_model(model) and args.gradient_checkpointing:
             model.enable_input_require_grads()
 
-        # When using QLoRA, the PEFT adapter weights are converted to bf16 to follow the recommendations from the
-        # original paper (see https://huggingface.co/papers/2305.14314, paragraph 3). Normally, this can be done by
+        # When using QLoRA in bf16, the PEFT adapter weights are converted to bf16 to follow the recommendations from
+        # the original paper (see https://huggingface.co/papers/2305.14314, paragraph 3). Normally, this can be done by
         # passing `autocast_adapter_dtype=False` to `get_peft_model`, but this option is not yet supported for
         # quantized models. See: https://github.com/huggingface/peft/issues/2889
+        # In fp16 or fp32, the adapters are kept in fp32 (the PEFT default), since the fp16 grad scaler can't unscale
+        # bf16 gradients, see #7776.
         # The DoRA magnitude vector is excluded: unlike LoRA A/B, its optimizer updates can be smaller than bf16 can
         # represent, silently freezing it, see #7268.
-        if _is_quantized_model:
+        if _is_quantized_model and args.bf16:
             for name, param in model.named_parameters():
                 if param.requires_grad and "lora_magnitude_vector" not in name:
                     param.data = param.data.to(torch.bfloat16)
